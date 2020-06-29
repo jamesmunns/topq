@@ -1,7 +1,9 @@
 #![cfg_attr(not(test), no_std)]
 
+use core::mem::MaybeUninit;
 use core::slice;
-use heapless::{ArrayLength, Vec};
+use generic_array::{ArrayLength, GenericArray};
+pub use generic_array::typenum::consts;
 
 /// A trait that represents a (probably rolling) timer of arbitrary
 /// precision.
@@ -46,8 +48,9 @@ where
     T: Timer,
     N: ArrayLength<TopqItem<D, P, T>>,
 {
-    queue: Vec<TopqItem<D, P, T>, N>,
+    queue: MaybeUninit<GenericArray<TopqItem<D, P, T>, N>>,
     timer: T,
+    used: usize,
 }
 
 impl<D, P, T, N> Topq<D, P, T, N>
@@ -60,8 +63,9 @@ where
     /// Create an empty Topq with the given timer
     pub fn new(timer: T) -> Self {
         Self {
-            queue: Vec::new(),
+            queue: MaybeUninit::uninit(),
             timer,
+            used: 0,
         }
     }
 
@@ -91,33 +95,49 @@ where
     }
 
     fn insert_item(&mut self, new_item: TopqItem<D, P, T>) {
-        // Where should we add this?
-        // TODO: We can probably do an insertion sort for cheaper than a binary
-        // search + unstable sort, especially for small arrays
-        match self
-            .queue
-            .binary_search_by(|ti| new_item.prio.cmp(&ti.prio))
-        {
+        let start_ptr = self.queue.as_mut_ptr().cast::<TopqItem<D, P, T>>();
+
+        // Find the insertion place
+        let result_idx = {
+            let mut_slice = unsafe { core::slice::from_raw_parts_mut(start_ptr, self.used) };
+            mut_slice.binary_search_by(|ti| new_item.prio.cmp(&ti.prio))
+        };
+
+        match result_idx {
             Ok(idx) => {
-                // We have found an exact priority match. Replace.
-                self.queue[idx] = new_item;
+                unsafe {
+                    // We have an exact priority match. Drop the old item and
+                    // replace it with the new.
+                    core::ptr::drop_in_place(start_ptr.add(idx));
+                    core::ptr::write(start_ptr.add(idx), new_item);
+                }
+            }
+            Err(idx) if idx == N::to_usize() => {
+                // Nothing to do, off the end
+            }
+            Err(idx) if idx == self.used => {
+                // Off the used end, but not off the total end
+                unsafe {
+                    core::ptr::write(start_ptr.add(idx), new_item);
+                    self.used += 1;
+                }
             }
             Err(idx) => {
-                // We have found an insertion position
-
-                // Is the queue already full?
-                if self.queue.len() == self.queue.capacity() {
-                    self.queue.pop();
+                if self.used == N::to_usize() {
+                    // Drop the last item, we're about to bump it
+                    self.used -= 1;
+                    unsafe {
+                        core::ptr::drop_in_place(start_ptr.add(self.used));
+                    }
                 }
-
-                // Add item to the end of the queue
-                self.queue.push(new_item).ok();
-
-                // If the insertion position was NOT at the end, sort the queue
-                if idx != self.queue.len() {
-                    self.queue
-                        .sort_unstable_by(|ti_a, ti_b| ti_b.prio.cmp(&ti_a.prio));
+                unsafe {
+                    let posn = start_ptr.add(idx);
+                    // scootch over the array
+                    core::ptr::copy(posn, posn.add(1), self.used - idx);
+                    // Put the new item where it goes
+                    core::ptr::write(posn, new_item);
                 }
+                self.used += 1;
             }
         }
     }
@@ -126,24 +146,40 @@ where
     ///
     /// See the module level documentation for when it is necessary to call this function
     pub fn prune(&mut self) {
-        // TODO: Do this without making a second queue (remove items and shift up as needed),
-        // or having to re-sort the queue because we popped everything backwards
-        // TODO: Probably sort with all invalid going to the back, and then truncate
-        // the list
-
+        let start_ptr = self.queue.as_mut_ptr().cast::<TopqItem<D, P, T>>();
         let now = self.timer.now();
 
-        let mut new = Vec::new();
+        let mut good = 0;
 
-        while let Some(item) = self.queue.pop() {
-            if item.valid_at_time(&now) {
-                new.push(item).ok();
+        for idx in 0..self.used {
+            unsafe {
+                // For each used item...
+                let idx_ptr = start_ptr.add(idx);
+                let good_ptr = start_ptr.add(good);
+
+                // Is the current item good?
+                let idx_good = (*idx_ptr).valid_at_time(&now);
+
+                if idx_good {
+                    // No need to copy if we are already here
+                    if good != idx {
+                        // Drop the destination item
+                        core::ptr::drop_in_place(good_ptr);
+
+                        // Move from source to destination
+                        core::ptr::copy_nonoverlapping(idx_ptr, good_ptr, 1);
+                    }
+
+                    // Move to the next good position
+                    good += 1;
+                } else {
+                    // This item is bad, drop it
+                    core::ptr::drop_in_place(idx_ptr);
+                }
             }
         }
 
-        new.sort_unstable_by(|ti_a, ti_b| ti_b.prio.cmp(&ti_a.prio));
-
-        self.queue = new;
+        self.used = good;
     }
 
     /// Obtain the highest priority and currently valid data, if any
@@ -151,8 +187,7 @@ where
     /// This is typically used when you ONLY need the current value, and not
     /// the remaining validity time or the priority of the currently valid data
     pub fn get_data(&self) -> Option<&D> {
-        self.get_item()
-            .map(|i| &i.item)
+        self.get_item().map(|i| &i.item)
     }
 
     /// Obtain the highest priority and currently valid topq item, if any
@@ -160,13 +195,13 @@ where
     /// This is typically used when you need the current value, AND ALSO need
     /// the remaining validity time or the priority of the currently valid data
     pub fn get_item(&self) -> Option<&TopqItem<D, P, T>> {
+        let start_ptr = self.queue.as_ptr().cast::<TopqItem<D, P, T>>();
+        let slice = unsafe { core::slice::from_raw_parts(start_ptr, self.used) };
+
         let now = self.timer.now();
-        self.queue
-            .iter()
-            .find(|item| item.valid_at_time(&now))
+        slice.iter().find(|item| item.valid_at_time(&now))
     }
 }
-
 
 #[derive(Debug)]
 pub struct TopqItem<D, P, T>
@@ -198,7 +233,6 @@ where
     }
 }
 
-
 impl<'a, D, P, T, N> IntoIterator for &'a Topq<D, P, T, N>
 where
     D: 'static,
@@ -210,7 +244,9 @@ where
     type IntoIter = slice::Iter<'a, TopqItem<D, P, T>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.queue.iter()
+        let start_ptr = self.queue.as_ptr().cast::<TopqItem<D, P, T>>();
+        let slice = unsafe { core::slice::from_raw_parts(start_ptr, self.used) };
+        slice.iter()
     }
 }
 
@@ -225,7 +261,9 @@ where
     type IntoIter = slice::IterMut<'a, TopqItem<D, P, T>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.queue.iter_mut()
+        let start_ptr = self.queue.as_mut_ptr().cast::<TopqItem<D, P, T>>();
+        let slice_mut = unsafe { core::slice::from_raw_parts_mut(start_ptr, self.used) };
+        slice_mut.iter_mut()
     }
 }
 
@@ -233,7 +271,7 @@ where
 mod test {
     use super::*;
     use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
-    use heapless::consts::*;
+    use generic_array::typenum::consts::*;
 
     #[derive(Debug)]
     struct FakeTimer(&'static AtomicU32);
@@ -349,6 +387,12 @@ mod test {
         TIMER.store(16, SeqCst);
         assert_eq!(q.get_data(), Some(&12));
 
+        q.prune();
+
+        q.into_iter().for_each(|t| {
+            println!("{:?}", t);
+        });
+
         TIMER.store(21, SeqCst);
         assert_eq!(q.get_data(), Some(&11));
 
@@ -357,6 +401,12 @@ mod test {
 
         TIMER.store(31, SeqCst);
         assert_eq!(q.get_data(), None);
+
+        q.prune();
+
+        q.into_iter().for_each(|t| {
+            println!("{:?}", t);
+        });
     }
 
     #[test]
